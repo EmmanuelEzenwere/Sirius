@@ -392,3 +392,4 @@ Roughly in the order I would tackle them:
    metrics collector) to bring up alongside the service.
 
 
+![Alt text](app/assets/image.png "Post Man for Testing API response time")
