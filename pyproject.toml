@@ -1,0 +1,37 @@
+[project]
+name = "sirius"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Ezenwere Emmanuel",email = "emmaezenwere@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.10, <3.11"
+dependencies = [
+    "fastapi (>=0.141.1,<0.142.0)",
+    "uvicorn[standard] (>=0.52.1,<0.53.0)",
+    "python-dotenv (>=1.2.2,<2.0.0)",
+    "scikit-learn (==1.0.2)",
+    "pandas (<2.3)",
+    "numpy (<1.24)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+package-mode = false
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.4.2"
+# TestClient drives the ASGI app in-process; httpx is its transport.
+httpx = "^0.28.1"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# `app` is imported as a top-level package, but pytest only puts the test
+# directory on sys.path. Without this, `from app.main import ...` fails.
+pythonpath = ["."]
+addopts = "-q --strict-markers"

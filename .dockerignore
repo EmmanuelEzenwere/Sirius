@@ -1,0 +1,40 @@
+# Keep the build context to the manifests, the model and the application code.
+# Everything below is either irrelevant to the image, or actively harmful in it.
+
+# Secrets — configuration is injected at deploy time, never baked in.
+.env
+.env.*
+
+.git
+.gitignore
+.github
+
+# A host virtualenv would shadow the one built in the builder stage.
+.venv
+venv
+ENV
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+
+tests/
+README.md
+LICENSE
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+.vscode/
+.idea/
+.DS_Store
