@@ -63,6 +63,15 @@ poetry run pytest
 The brief requires `scikit-learn==1.0.2`, which pins the rest. `numpy<1.24` is needed because 1.24 removed the `np.float`/`np.int` aliases that 1.0.2 relies on, `pandas<2.3` follows from that, and Python is capped at `<3.11` because no 1.0.2 wheels exist for 3.11 and up. Relax any one of these and the model binary stops unpickling.
 </details>
 
+### Configuration
+
+Read from the environment, with `.env` loaded at startup for local runs.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MODEL_PATH` | bundled `models/fraud-model.pickle` | Model artifact to serve. Resolved relative to the package root, so it works from any working directory. |
+| `MODEL_VERSION` | `unknown` | Label returned as `model_version`. Set by the deploy pipeline to the artifact's version. |
+
 ## API
 
 ### `POST /fraud-score`
@@ -76,10 +85,25 @@ All 30 features required, all floats:
 Response:
 
 ```json
-{ "fraud-score": 0.086 }
+{
+  "fraud-score": 0.086,
+  "model_version": "v1.4.2-a3f9c1",
+  "transaction_id": "a9b5080f-1ca3-4da8-a5bb-f11a9220897e"
+}
 ```
 
 `fraud-score` is `P(fraud)` in `[0, 1]`. The hyphenated key matches the brief and is carried by a Pydantic alias.
+
+`model_version` comes from the `MODEL_VERSION` env var, defaulting to `unknown`. It costs nothing to include and without it a score cannot be attributed to the artifact that produced it, which makes A/B analysis and incident forensics guesswork.
+
+`transaction_id` is the correlation id for the request, echoed in both the body and the `X-Transaction-Id` response header.
+
+| Header | Direction | Meaning |
+|---|---|---|
+| `X-Transaction-Id` | request, optional | Correlation id. Supply one to trace a transaction across services; if absent a `uuid4` is generated. |
+| `X-Transaction-Id` | response, always | The id in effect for this request, supplied or generated. Set on every response including `422` and `500`, which is when a caller most needs it. |
+
+The same id is stamped on every JSON log line the request produces, so a score can be joined to its logs without logging the request body. Feature values stay out of the logs: they are personal data.
 
 | Status | Meaning |
 |---|---|
@@ -88,6 +112,20 @@ Response:
 | `500` | Inference failed; logged server-side, not echoed to the caller |
 
 Validation happens at the boundary, and it is a deliberate design choice. The request schema is a Pydantic model, so three of the best practices the brief rewards fall out of one decision: malformed or missing fields are rejected with an automatic `422` before any model code runs, `extra="forbid"` enforces the exact contract instead of silently dropping unknown keys, and the typed `FraudResponse` makes the API self-documenting in `/docs`. Exception detail is deliberately kept out of `500` bodies so internals don't leak to callers.
+
+### Operational endpoints
+
+| Endpoint | Success | Purpose |
+|---|---|---|
+| `GET /health` | `200 {"status": "ok"}` | Liveness. Checks nothing but the process. |
+| `GET /ready` | `200 {"status": "ready"}`, else `503 {"status": "not ready"}` | Readiness. Scores a throwaway zero row to prove the model works. |
+| `GET /metrics` | `200`, Prometheus text | Request counts, latency histogram, in-flight gauge. |
+
+**Liveness and readiness are deliberately different checks.** A liveness failure means "restart me", and a restart cannot reload a missing artifact or fix a corrupt one, so folding dependency checks into `/health` would turn a readiness problem into a restart loop. That split is why the container `HEALTHCHECK` probes `/health` while the ECS target group should point at `/ready`: the orchestrator restarts on the first, the load balancer drains on the second.
+
+`/ready` runs a real `predict_proba` rather than testing the model global for truthiness, because "the object exists" and "the object can score" are different claims and only the second one means traffic should be routed here.
+
+`/health`, `/ready` and `/metrics` are excluded from the metrics themselves. They fire on a fixed timer, so counting them would swamp real traffic and drag the latency percentiles toward the trivial handlers.
 
 ## The model
 
@@ -146,7 +184,7 @@ The pytest suite includes a single-request smoke check, but a `TestClient` runs 
 
 **Immutable image, model baked in.** A multi-stage `Dockerfile` on `python:3.10-slim`. The build stage resolves Poetry deps into a venv, the runtime stage copies just the venv and app and runs non-root. The model ships inside the image so the tag fully determines behaviour: rollback is a tag change, there is no network dependency at startup, and two replicas can't serve different versions. That is the right trade-off for a model retrained weekly or slower. If it were hourly I'd fetch from S3 at startup with a pinned, checksum-verified version and a readiness probe that fails closed.
 
-**ECS Fargate behind an ALB.** Stateless, CPU-bound, horizontally scalable, so nothing here justifies managing nodes. EKS only if the platform were already Kubernetes.
+**ECS Fargate behind an ALB.** Stateless, CPU-bound, horizontally scalable, so nothing here justifies managing nodes. EKS only if the platform were already Kubernetes. Point the target group health check at **`/ready`**, not `/health`: the ALB's job is to decide where to send traffic, so it wants the check that fails when the model can't score. The container `HEALTHCHECK` uses `/health`, which is the restart signal.
 
 <details>
 <summary>Services</summary>
@@ -172,7 +210,7 @@ The pytest suite includes a single-request smoke check, but a `TestClient` runs 
 
 Three layers, because a fraud service can be green on every infra metric while quietly making bad calls.
 
-**Service health.** Request rate, error rate by status class, and duration as p50/p95/**p99** (never the mean, which hides the tail the SLO is written against), plus CPU and memory and ALB errors. `prometheus-fastapi-instrumentator` covers most of it. Structured JSON logs with a correlation ID, and **no PII or raw feature values**.
+**Service health.** Request rate, error rate by status class, and duration as p50/p95/**p99** (never the mean, which hides the tail the SLO is written against), plus CPU and memory and ALB errors. Implemented: `prometheus-fastapi-instrumentator` exposes counts, a latency histogram and an in-flight gauge on `/metrics`, and logs are JSON on stdout with a `transaction_id` on every line, including uvicorn's own access logs. Structured output is what makes the correlation id useful, since CloudWatch Logs Insights can filter on it as a field rather than regex-matching a formatted string. **No PII or raw feature values** are logged.
 
 **Model health**, the part that makes it an ML service, needed from day one:
 
@@ -234,8 +272,8 @@ Not yet covered: a golden-value test pinning the score for the mock body to catc
 
 Roughly in the order I'd tackle them:
 
-1. **`/health` and `/ready` endpoints.** Explicit liveness and readiness checks, with readiness running a real prediction. The container healthcheck currently probes `/openapi.json`, which works but is incidental rather than a purpose-built check.
-2. **Observability.** `model_version` and `transaction_id` on the response schema, structured JSON logging with a correlation ID, and Prometheus instrumentation.
-3. **Wire the load test into CI** and commit the resulting numbers, so the p99 table is enforced rather than a one-off.
+1. **Wire the load test into CI** and commit the resulting numbers, so the p99 table is enforced rather than a one-off.
+2. **Distributed tracing.** The correlation id is in place, so the remaining step is OpenTelemetry spans exported to X-Ray or an OTLP backend, which is what makes the id useful across service boundaries rather than just within this one.
+3. **Scrape the metrics somewhere.** `/metrics` is exposed but nothing collects it yet: Managed Prometheus plus Grafana dashboards, and the p99 and 5xx alarms that gate the blue/green rollback described above.
 4. **Retrain without `Time`**, or wrap the estimator in a `Pipeline`, so the contract stops carrying a field that means nothing to callers.
 5. **`docker-compose.yml`** once there are local dependencies (feature store, metrics collector) to bring up alongside the service.

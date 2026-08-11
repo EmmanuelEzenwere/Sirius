@@ -68,8 +68,10 @@ class TestScoring:
         assert response.json()[SCORE_KEY] == pytest.approx(expected)
 
     def test_is_deterministic(self, client: TestClient, body) -> None:
-        first = client.post(ENDPOINT, json=body).json()
-        second = client.post(ENDPOINT, json=body).json()
+        # Only the score: transaction_id is unique per request by design, so
+        # comparing whole payloads would assert the opposite of what we want.
+        first = client.post(ENDPOINT, json=body).json()[SCORE_KEY]
+        second = client.post(ENDPOINT, json=body).json()[SCORE_KEY]
 
         assert first == second
 

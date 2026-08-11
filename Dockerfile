@@ -73,11 +73,12 @@ USER sirius
 EXPOSE 8888
 
 # curl is deliberately absent from the runtime image, so the probe uses the
-# interpreter that is already here. Point this at /health once that endpoint
-# exists — /openapi.json proves the process serves HTTP, not that the model
-# loaded and can score.
+# interpreter that is already here. This is liveness only: /health answers "is
+# the process up", which is the question a container restart can fix. Whether
+# the model can score is /ready, and that belongs on the ECS/ALB target group,
+# which can drain a task instead of killing it.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8888/openapi.json', timeout=2)" \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8888/health', timeout=2)" \
     || exit 1
 
 # Exec form, so uvicorn is PID 1 and receives SIGTERM directly. Under the shell
