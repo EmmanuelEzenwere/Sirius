@@ -214,6 +214,48 @@ Three layers, because a fraud service can be green on every infra metric while q
 
 **Service health.** Request rate, error rate by status class, and duration as p50/p95/**p99** (never the mean, which hides the tail the SLO is written against), plus CPU and memory and ALB errors. Implemented: `prometheus-fastapi-instrumentator` exposes counts, a latency histogram and an in-flight gauge on `/metrics`, and logs are JSON on stdout with a `transaction_id` on every line, including uvicorn's own access logs. Structured output is what makes the correlation id useful, since CloudWatch Logs Insights can filter on it as a field rather than regex-matching a formatted string. **No PII or raw feature values** are logged.
 
+### Running the observability stack
+
+That service-health layer is runnable. It is an optional extra and the API does not depend on it: `docker compose up --build` brings up the API with Prometheus and Grafana beside it, datasource and dashboard provisioned, no clicking required.
+
+![alt text](assets/grafana-service-monitoring.png)
+```bash
+docker compose up --build
+```
+
+| Service | URL | Login |
+|---|---|---|
+| API | `http://localhost:8888` | none |
+| Grafana | `http://localhost:3000` | anonymous viewer, or `admin` / `admin` to edit |
+| Prometheus | `http://localhost:9090` | none |
+
+Grafana opens on the **Sirius: fraud scoring (RED)** dashboard. Prometheus scrapes `app:8888/metrics` by compose service name every 5s, and `Status > Targets` should show the job `sirius-app` as UP. The panels are empty until something generates traffic, so drive some:
+
+```bash
+./scripts/loadtest.sh
+```
+
+Rate, latency, in-flight, and status-code panels populate within a scrape or two. The 5xx series stays empty unless something actually fails, which is the correct reading rather than a broken panel.
+
+Prometheus waits for the app's `HEALTHCHECK` before starting, so the first scrape lands on a container that has already loaded and warmed the model. Tear the stack down with `docker compose down`, or `docker compose down -v` to discard the metric history too.
+
+<details>
+<summary>Which metrics the dashboard queries, and one caveat</summary>
+
+Confirmed against a live `/metrics` rather than assumed:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `http_requests_total` | counter | `handler`, `method`, `status` |
+| `http_request_duration_seconds_bucket` | histogram | `handler`, `method`, `le`. Buckets 0.1 / 0.5 / 1.0 only |
+| `http_request_duration_highr_seconds_bucket` | histogram | `le` only. 22 buckets from 0.01 to 60 |
+| `http_requests_inprogress` | gauge | `handler`, `method` |
+
+Note the labelled duration histogram carries no `status` label, so latency cannot be split by status code without changing the instrumentation.
+
+Percentiles come from the high-resolution histogram, which is what it exists for. The caveat is its lowest bucket edge of 10ms: under load it resolves fine (this stack measured p50 46ms, p99 239ms at ~320 rps), but an idle service answering in about 3ms puts every observation in the first bucket, and `histogram_quantile` can then only interpolate within `[0, 0.01]`. Those stack figures run slower than the 188ms benchmark in Performance because the containerised app here shares a throttled Docker-for-Mac VM with Prometheus and Grafana; they show the percentiles resolve, they are not the latency benchmark. A suspiciously flat p50 near 5ms is the bucket floor, not the service. The mean-latency panel is exact at any scale and is there to cross-check. The real fix is a sub-10ms bucket in the Instrumentator config, which is an application change and so out of scope here.
+</details>
+
 **Model health**, the part that makes it an ML service, needed from day one:
 
 - *Score-distribution drift* against a training baseline (PSI or KL). The leading indicator: it moves before any labels arrive and catches upstream pipeline breakage fastest.
@@ -251,7 +293,7 @@ For this model specifically, `V1` to `V28` come from an unpublished PCA rotation
 
 ## Testing
 
-`pytest` with FastAPI's `TestClient`, in-process, no sockets, runs in under a second. Four groups:
+`pytest` with FastAPI's `TestClient`, in-process, no sockets, runs in under a second. Five groups:
 
 - **Contract**, the load-bearing one. Because the estimator has no feature names, mis-ordered input fails silently, so these assert `FEATURE_COLUMNS == list(Features.model_fields)`, that the count matches `model.n_features_in_`, that the row preserves declared order, and that `classes_ == [0, 1]` (else `predict_proba[:, 1]` is the *non*-fraud probability).
 - **Scoring.** Status and range, agreement with a direct `predict_proba`, determinism, key-order independence, and a sensitivity sweep over the most-split features so a constant-output bug can't hide.
@@ -274,6 +316,6 @@ Roughly in the order I'd tackle them:
 
 1. **Wire the load test into CI** and commit the resulting numbers, so the p99 table is enforced rather than a one-off.
 2. **Distributed tracing.** The correlation id is in place, so the remaining step is OpenTelemetry spans exported to X-Ray or an OTLP backend, which is what makes the id useful across service boundaries rather than just within this one.
-3. **Scrape the metrics somewhere.** `/metrics` is exposed but nothing collects it yet: Managed Prometheus plus Grafana dashboards, and the p99 and 5xx alarms that gate the blue/green rollback described above.
+3. **Production metrics collection and alarms.** A local Prometheus and Grafana stack ships in this repo (see Monitoring); production needs the managed equivalent, Amazon Managed Prometheus plus Grafana, and the p99 and 5xx alarms that gate the blue/green rollback described above.
 4. **Retrain without `Time`**, or wrap the estimator in a `Pipeline`, so the contract stops carrying a field that means nothing to callers.
-5. **`docker-compose.yml`** once there are local dependencies (feature store, metrics collector) to bring up alongside the service.
+5. **Extend the local stack** with a mock feature store, so the feature-serving path can be exercised end to end alongside the service and its metrics rather than only described.

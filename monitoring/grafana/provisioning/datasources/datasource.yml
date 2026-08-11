@@ -1,0 +1,20 @@
+# Wires Grafana to Prometheus at startup so the stack needs no manual setup.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    # A fixed uid, because the provisioned dashboard references the datasource
+    # by uid. Let Grafana generate one and the dashboard panels come up empty.
+    uid: sirius-prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    # Provisioned config is owned by this file, not by the UI. Editing in the
+    # browser would be silently reverted on the next restart, so disallow it.
+    editable: false
+    jsonData:
+      # Matches the scrape interval, so Grafana's $__rate_interval picks a
+      # window wide enough to contain samples.
+      timeInterval: 5s

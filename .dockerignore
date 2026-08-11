@@ -35,6 +35,12 @@ Dockerfile
 .dockerignore
 docker-compose*.yml
 
+# Prometheus and Grafana config. Mounted into those containers at run time by
+# compose; the app image has no use for it.
+monitoring/
+scripts/
+assets/
+
 .vscode/
 .idea/
 .DS_Store

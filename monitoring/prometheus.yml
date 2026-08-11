@@ -1,0 +1,26 @@
+# Scrape config for the local observability stack (see docker-compose.yml).
+#
+# The app is reached by its compose service name on the shared network.
+# "localhost" here would be the Prometheus container itself, which serves no
+# application metrics.
+
+global:
+  # 5s rather than the usual 15s or 60s: this stack exists to make a load test
+  # visible while it is still running, and a slow scrape makes short bursts
+  # disappear between samples.
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: sirius-app
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["app:8888"]
+        labels:
+          service: sirius
+
+  # Self-scrape, so "is Prometheus itself healthy" is answerable from the same
+  # place as everything else.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

@@ -1,0 +1,21 @@
+# Loads every dashboard JSON from the mounted directory at startup.
+#
+# The path is /etc/grafana/dashboards rather than somewhere under
+# /var/lib/grafana, to keep this read-only bind mount from nesting inside the
+# grafana-data volume.
+
+apiVersion: 1
+
+providers:
+  - name: sirius
+    orgId: 1
+    folder: Sirius
+    type: file
+    disableDeletion: false
+    # Picked up within 10s, so editing the JSON on the host and refreshing the
+    # browser is enough to iterate. No container restart needed.
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false
