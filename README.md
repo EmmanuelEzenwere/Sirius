@@ -10,7 +10,7 @@
 
 ---
 
-Sirius wraps a pre-trained `RandomForestClassifier` behind a single HTTP endpoint and returns the **probability** a payment is fraudulent, not an accept/decline. The threshold is a business call that shifts with risk appetite, merchant, and season, so it stays with the caller rather than baked into the model. Changing policy never means redeploying the model.
+Sirius wraps a pre-trained `RandomForestClassifier` behind a single HTTP endpoint and returns the **probability** a payment is fraudulent.
 
 ## Contents
 
