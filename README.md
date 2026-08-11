@@ -1,11 +1,16 @@
-# Sirius — Realtime Fraud Scoring API
-
-A RESTful service that wraps a pre-trained `sklearn.ensemble.RandomForestClassifier` and returns the
-probability that a payment transaction is fraudulent.
-
-The API returns a **probability rather than a fraud/legitimate decision**. The threshold for making that decision is a business choice and can change depending on risk appetite, merchant type, seasonality, etc. Keeping the threshold outside the model service means that changing the policy does not require redeploying the model.
+<p align="center">
+  <h1 align="center">Sirius</h1>
+  <p align="center"><strong>Realtime fraud scoring API</strong></p>
+  <p align="center">
+    <img src="https://img.shields.io/badge/python-3.10-blue.svg" alt="Python 3.10">
+    <img src="https://img.shields.io/badge/scikit--learn-1.0.2-orange.svg" alt="scikit-learn 1.0.2">
+    <img src="https://img.shields.io/badge/FastAPI-teal.svg" alt="FastAPI">
+  </p>
+</p>
 
 ---
+
+Sirius wraps a pre-trained `RandomForestClassifier` behind a single HTTP endpoint and returns the **probability** a payment is fraudulent, not an accept/decline. The threshold is a business call that shifts with risk appetite, merchant, and season, so it stays with the caller rather than baked into the model. Changing policy never means redeploying the model.
 
 ## Contents
 
@@ -15,16 +20,14 @@ The API returns a **probability rather than a fraud/legitimate decision**. The t
 - [Performance](#performance)
 - [Deployment](#deployment)
 - [Monitoring](#monitoring)
-- [Feature computation and serving](#feature-computation-and-serving)
+- [Features in production](#features-in-production)
 - [Testing](#testing)
-- [Other considerations](#other-considerations)
+- [Notes](#notes)
 - [Given more time](#given-more-time)
-
----
 
 ## Quick start
 
-### Docker (recommended)
+### Docker
 
 ```bash
 docker build -t sirius:local .
@@ -40,10 +43,7 @@ poetry install
 poetry run uvicorn app.main:app --host 0.0.0.0 --port 8888
 ```
 
-Either way the service listens on `http://localhost:8888`, with interactive OpenAPI docs at
-`http://localhost:8888/docs`.
-
-Verify with the supplied mock request body:
+Either way the service listens on `http://localhost:8888`, with OpenAPI docs at `/docs`. Verify it with the supplied mock body:
 
 ```bash
 curl -X POST http://localhost:8888/fraud-score \
@@ -51,345 +51,193 @@ curl -X POST http://localhost:8888/fraud-score \
   -d @tests/mock-request-body.json
 ```
 
-### Tests
+Run the tests:
 
 ```bash
-poetry install --with dev
 poetry run pytest
 ```
 
-### Dependency pinning
+<details>
+<summary>Why the versions are pinned</summary>
 
-The assignment pins `scikit-learn==1.0.2`, which constrains everything downstream of it. `numpy<1.24`
-and `pandas<2.3` are required because sklearn 1.0.2 predates the `np.float`/`np.int` alias removal in
-NumPy 1.24, and Python is capped at `<3.11` because no 1.0.2 wheels were built for 3.11+. These are
-not arbitrary — relaxing any one of them breaks unpickling of the model binary.
-
-### Configuration
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `MODEL_PATH` | `models/fraud-model.pickle` | Location of the serialised model |
-
-Read from the environment, with `.env` loaded at startup for local development.
-
----
+The brief requires `scikit-learn==1.0.2`, which pins the rest. `numpy<1.24` is needed because 1.24 removed the `np.float`/`np.int` aliases that 1.0.2 relies on, `pandas<2.3` follows from that, and Python is capped at `<3.11` because no 1.0.2 wheels exist for 3.11 and up. Relax any one of these and the model binary stops unpickling.
+</details>
 
 ## API
 
 ### `POST /fraud-score`
 
-Request body — all 30 features are required, all floats:
+All 30 features required, all floats:
 
 ```json
-{
-  "Time": 0.0,
-  "V1": -1.3598071336738,
-  "V2": -0.0727811733098497,
-  "...": "V3 through V28",
-  "Amount": 149.62
-}
+{ "Time": 0.0, "V1": -1.3598, "V2": -0.0728, "...": "V3 through V28", "Amount": 149.62 }
 ```
 
 Response:
 
 ```json
-{
-  "fraud-score": 0.086
-}
+{ "fraud-score": 0.086 }
 ```
 
-`fraud-score` is `P(class = 1)`, a float in `[0.0, 1.0]`. The hyphenated key follows the brief; it is
-carried by a Pydantic alias, since `fraud-score` is not a valid Python identifier.
+`fraud-score` is `P(fraud)` in `[0, 1]`. The hyphenated key matches the brief and is carried by a Pydantic alias.
 
 | Status | Meaning |
 |---|---|
 | `200` | Score returned |
-| `422` | Request body failed validation — missing, extra or non-numeric fields |
-| `500` | Model inference failed; details logged server-side, not returned to the caller |
+| `422` | Body failed validation: missing, extra, or non-numeric fields |
+| `500` | Inference failed; logged server-side, not echoed to the caller |
 
-Validation is handled by a Pydantic model, so malformed input is rejected at the boundary with a
-descriptive `422` before it ever reaches the estimator. Error details are deliberately not echoed back
-on a `500`, to avoid leaking internals to callers.
-
----
+Validation happens at the boundary, and it is a deliberate design choice. The request schema is a Pydantic model, so three of the best practices the brief rewards fall out of one decision: malformed or missing fields are rejected with an automatic `422` before any model code runs, `extra="forbid"` enforces the exact contract instead of silently dropping unknown keys, and the typed `FraudResponse` makes the API self-documenting in `/docs`. Exception detail is deliberately kept out of `500` bodies so internals don't leak to callers.
 
 ## The model
 
-A `RandomForestClassifier` of **15 trees at `max_depth=5`**, trained on the 30 features of the ULB
-credit-card fraud dataset: `Time`, `V1`–`V28`, `Amount`.
+Fifteen trees, `max_depth=5`, trained on the ULB credit-card dataset (`Time`, `V1` to `V28`, `Amount`). Two facts about this binary shape the design.
 
-Two properties of this binary drive design decisions here:
+**`V1` to `V28` are PCA components.** The publishers released only the components; the rotation matrix was never shared. So the service does no feature engineering. It expects already-transformed vectors. [How that stage would work in production is below.](#features-in-production)
 
-**`V1`–`V28` are principal components.** The dataset's publishers ran PCA over the original transaction
-attributes and released only the components, because the underlying fields are commercially and
-personally sensitive. The rotation matrix was never published. This service therefore performs **no
-feature engineering** — it expects vectors that have already been transformed. See
-[Feature computation and serving](#feature-computation-and-serving) for how that stage would work in a
-real deployment.
+**The estimator has no `feature_names_in_`.** It was fit on a raw array, so it silently accepts mis-ordered columns and returns a confident wrong answer. `FEATURE_COLUMNS` in `app/main.py` is the single source of truth for order, derived directly from the Pydantic schema (`list(Features.model_fields)`) so the two cannot drift. Nothing downstream would catch a mistake here, so the contract is pinned in one place and tested.
 
-**The estimator carries no `feature_names_in_`.** It was fitted on a raw array rather than a DataFrame,
-so it has no record of its own column names and will silently accept mis-ordered input, returning a
-confident and wrong answer. The `FEATURE_COLUMNS` constant in `app/main.py` is the single source of
-truth for ordering, and the Pydantic schema is what guarantees every field is present. Nothing
-downstream will catch a mistake here, which is why the contract is pinned in one place and the row is
-constructed from it explicitly.
-
-`Time` deserves a note: in the source dataset it is *seconds elapsed since the first transaction in the
-dataset* — a windowing artifact, not a property of a transaction. A production caller has no meaningful
-value to supply. It is retained because the estimator requires exactly 30 columns, but inspection of
-the fitted trees shows it is used in only **1 of 321 split nodes**, so it is very nearly inert. The
-correct long-term fix is to retrain on 29 features rather than to keep asking clients for a number that
-means nothing to them.
-
----
+`Time` is a quirk. In the dataset it is seconds since the first record, meaningless to a real caller. It survives only because the model needs 30 columns, and it appears in just 1 of 321 split nodes. The real fix is retraining on 29 features, not asking clients for a number they can't produce.
 
 ## Performance
 
-Target is a p99 under 200ms. The model itself is nowhere near the bottleneck.
+Target is p99 under 200ms, and the model is nowhere near the bottleneck. Fifteen depth-5 trees is about 75 comparisons, single-digit microseconds. The budget goes to JSON parsing, validation, and the HTTP round trip, so that is where tuning belongs.
 
-**Where the time actually goes.** Fifteen depth-5 trees is at most 75 comparisons per prediction —
-single-digit microseconds. Essentially all of the request budget is JSON parsing, Pydantic validation,
-row construction and the HTTP round trip. Optimisation effort belongs in the request path, not the
-estimator.
+- **`def`, not `async def`.** `predict_proba` is blocking CPU work; on the event loop it would stall every other request. As a sync endpoint FastAPI runs it in a threadpool, and sklearn releases the GIL in its Cython loop so those threads run in parallel. This is the change that actually protects the tail: a single request looks fast either way, but under concurrency an async blocking handler serialises everything behind the event loop and the p99 balloons.
+- **Model loaded once at import**, held in memory. Deserializing per request would blow the whole budget.
+- **The input row is a bare NumPy array**, built directly from `FEATURE_COLUMNS`, not a per-request `DataFrame`. That keeps roughly 100 to 200µs of DataFrame construction (an order of magnitude more than the prediction itself) off the hot path, and since the estimator was fitted without feature names, a bare array also avoids the per-call `X has feature names` warning sklearn would otherwise log on every request.
 
-**The endpoint is `def`, not `async def`.** This is intentional. `predict_proba` is blocking CPU-bound
-work; declaring it `async` would run it directly on the event loop and stall every other in-flight
-request behind it. As a sync endpoint, FastAPI dispatches it to a worker threadpool, keeping the loop
-free. sklearn's tree traversal releases the GIL in its Cython inner loop, so those threads genuinely
-run in parallel.
+### Latency
 
-**Model loaded once at import.** Deserialising the pickle per request would dominate the latency
-budget entirely. It is loaded at module import and held in process memory for the lifetime of the
-container.
+Single-request latency is about 45ms locally (Postman, includes client and network overhead, so real server compute is lower):
 
-**Applied but worth stating explicitly:**
+![Postman latency test](assets/postman-latency.png)
 
-- Pin `n_jobs=1` on the estimator. Joblib's dispatch overhead exceeds the cost of scoring 15 tiny trees;
-  parallelism here is net-negative.
-- Set `OMP_NUM_THREADS=1` / `MKL_NUM_THREADS=1` in the container. Otherwise each uvicorn worker spawns
-  a full BLAS thread pool and they oversubscribe the CPU, which shows up as erratic tail latency.
-- Run `workers = CPU cores`, and scale horizontally. The workload is embarrassingly parallel and
-  stateless.
-- Warm the model with a dummy prediction at startup. The first call through sklearn's code paths pays
-  one-off import and allocation costs, and without a warm-up that lands on a real customer request
-  right after every deploy.
+A single request cannot show the tail, though. For p99 under load, `scripts/loadtest.sh` drives [`hey`](https://github.com/rakyll/hey) at 50 concurrent connections against the mock body and prints the table below:
 
-**Known inefficiency.** Building a one-row `pandas.DataFrame` per request costs on the order of
-100–200µs — an order of magnitude more than the prediction it feeds. A plain 2-D NumPy array built
-directly from `FEATURE_COLUMNS` would remove that, at the cost of some readability. It is well within
-budget at current scale, but it is the first thing I would change if the p99 tightened.
+| Metric | Value |
+|---|---|
+| Load | 2000 requests at concurrency 50 |
+| p50 | _tbd_ ms |
+| p90 | _tbd_ ms |
+| p95 | _tbd_ ms |
+| p99 | _tbd_ ms |
+| Throughput | _tbd_ req/s |
 
----
+Reproduce:
+
+```bash
+brew install hey                                              # once
+poetry run uvicorn app.main:app --host 0.0.0.0 --port 8888    # terminal 1
+./scripts/loadtest.sh                                         # terminal 2
+```
+
+The pytest suite includes a single-request smoke check, but a `TestClient` runs in-process and sequentially, so it cannot produce a meaningful p99. The tail number has to come from a real load tool against the running server, which is what the script above is for.
+
+<details>
+<summary>Tuning to apply and verify in the container</summary>
+
+- `n_jobs=1` on the estimator. Joblib dispatch costs more than scoring 15 tiny trees.
+- `OMP_NUM_THREADS=1` and `MKL_NUM_THREADS=1`. Otherwise each worker spawns a BLAS pool and oversubscribes the CPU, which shows up as erratic tail latency. (Set in the `Dockerfile`.)
+- `workers = CPU cores`, scale horizontally. The workload is stateless and embarrassingly parallel.
+- A warm-up prediction at startup, so the first real request doesn't pay one-off allocation costs.
+</details>
 
 ## Deployment
 
-**Package as an immutable image.** A multi-stage `Dockerfile` on `python:3.10-slim`: build stage
-resolves Poetry dependencies into a virtualenv, runtime stage copies only that venv and the application
-code, and runs as a non-root user. This keeps the final image small and reduces attack surface.
+**Immutable image, model baked in.** A multi-stage `Dockerfile` on `python:3.10-slim`. The build stage resolves Poetry deps into a venv, the runtime stage copies just the venv and app and runs non-root. The model ships inside the image so the tag fully determines behaviour: rollback is a tag change, there is no network dependency at startup, and two replicas can't serve different versions. That is the right trade-off for a model retrained weekly or slower. If it were hourly I'd fetch from S3 at startup with a pinned, checksum-verified version and a readiness probe that fails closed.
 
-**Bake the model into the image** rather than fetching it from S3 at startup. It makes the image a
-single versioned artifact — image tag `v1.4.2-model-a3f9c1` fully determines behaviour, rollback is a
-tag change, and there is no network dependency in the startup path or risk of two replicas serving
-different model versions after a partial restart. The trade-off is that shipping a new model means
-rebuilding the image; for a model that retrains weekly or slower this is the right side of the trade.
-If retraining cadence were hourly, I would switch to S3-at-startup with a checksum-verified, pinned
-model version and a readiness probe that fails closed if the fetch fails.
+**ECS Fargate behind an ALB.** Stateless, CPU-bound, horizontally scalable, so nothing here justifies managing nodes. EKS only if the platform were already Kubernetes.
 
-**Runtime: ECS Fargate behind an Application Load Balancer.** The workload is stateless, CPU-bound and
-horizontally scalable, so there is nothing here that justifies managing nodes. Fargate removes the
-node-patching burden entirely. EKS would be the alternative if the wider platform were already
-Kubernetes and shared tooling mattered more than operational simplicity.
-
-**Services:**
+<details>
+<summary>Services</summary>
 
 | Concern | Service |
 |---|---|
-| Image registry | ECR, with scan-on-push |
+| Registry | ECR, scan-on-push |
 | Compute | ECS Fargate |
 | Ingress | ALB, TLS terminated at the load balancer |
-| Autoscaling | Application Auto Scaling, target-tracking on request count per target |
-| Config / secrets | SSM Parameter Store, Secrets Manager for anything sensitive |
-| Model artifacts | S3, fronted by SageMaker Model Registry or MLflow for lineage |
-| Logs / metrics / alarms | CloudWatch, with Managed Prometheus + Grafana if metrics volume justifies it |
-| Tracing | AWS X-Ray or OpenTelemetry → any OTLP backend |
-| CI/CD | GitHub Actions → ECR → ECS rolling or blue/green deploy via CodeDeploy |
+| Autoscaling | target-tracking on requests per target |
+| Config / secrets | SSM Parameter Store, Secrets Manager |
+| Model artifacts | S3, with SageMaker Model Registry or MLflow for lineage |
+| Logs / metrics | CloudWatch, Managed Prometheus and Grafana at volume |
+| Tracing | X-Ray or OpenTelemetry to any OTLP backend |
+| CI/CD | GitHub Actions to ECR to ECS, blue/green via CodeDeploy |
+</details>
 
-**Rollout.** Blue/green with automatic rollback on a 5xx or p99 latency alarm. For model changes
-specifically, run the new version in **shadow mode** first — mirror live traffic to it, log its scores,
-compare the distribution against the incumbent, and only promote once the score distribution and
-business metrics look sane on real traffic. Fraud models can pass every offline metric and still shift
-approval rates in production.
+**Rollout: blue/green with auto-rollback** on a 5xx or p99 alarm. Minimum two tasks across AZs, because payment auth is in the critical path and a single task makes every deploy an outage.
 
-**Multi-AZ, minimum two tasks.** Payment authorisation is in the critical path of taking money; a
-single-task deployment makes every deploy an outage.
-
----
+**Validating a model change** uses two complementary steps, framed the way Checkout's own risk tooling does. Backtesting runs a candidate against specific historical periods and measures its performance offline in minutes, a fast first read on whether the change is worth shipping at all. Shadow testing then mirrors live traffic to the new version over time and logs its scores without acting on them, so its score distribution and would-be decisions can be compared against the incumbent on real traffic before promotion. Fraud models pass every offline metric and still shift approval rates in production, so the shadow run is the step that actually de-risks the rollout.
 
 ## Monitoring
 
-Three layers, because a fraud service can be perfectly healthy by infrastructure standards while
-quietly making bad decisions.
+Three layers, because a fraud service can be green on every infra metric while quietly making bad calls.
 
-**Service health (RED).** Request rate, error rate split by status class, and duration as p50/p95/p99 —
-never the mean, which hides exactly the tail the SLO is written against. Plus container CPU and memory,
-ALB 5xx and target connection errors. `prometheus-fastapi-instrumentator` gives most of this from the
-FastAPI side with a few lines. Alert on p99 breaching 200ms and on any sustained 5xx rate.
+**Service health.** Request rate, error rate by status class, and duration as p50/p95/**p99** (never the mean, which hides the tail the SLO is written against), plus CPU and memory and ALB errors. `prometheus-fastapi-instrumentator` covers most of it. Structured JSON logs with a correlation ID, and **no PII or raw feature values**.
 
-Structured JSON logs with a correlation ID per request, shipped to CloudWatch Logs. **No PII and no
-raw feature values in logs** — see [security](#other-considerations).
+**Model health**, the part that makes it an ML service, needed from day one:
 
-**Model health.** This is what distinguishes an ML service from a normal one, and it needs to be in
-place from day one:
+- *Score-distribution drift* against a training baseline (PSI or KL). The leading indicator: it moves before any labels arrive and catches upstream pipeline breakage fastest.
+- *Feature drift*, null rates, out-of-range counts. A feature silently arriving as zeros is a common, expensive failure.
+- *Prediction volume* by segment, which catches traffic that stops as well as traffic that spikes.
 
-- *Score distribution drift.* Track the daily distribution of `fraud-score` against a baseline captured
-  at training time, using PSI or KL divergence. This is the leading indicator — it moves before you
-  have any labels, and it catches upstream feature-pipeline breakage faster than anything else.
-- *Feature drift.* Per-feature distribution monitoring against training baselines, plus null rates and
-  out-of-range counts. A feature that silently starts arriving as zeros is a common and expensive
-  failure.
-- *Prediction volume* by segment, to catch traffic that stops arriving as well as traffic that spikes.
+**Business outcomes, on a lag.** True labels are chargebacks, weeks to months later. Precision, recall, and AUC at the threshold are a scheduled batch join against settled outcomes, backfilled to the prediction date, not a live dashboard. Track approval and false-positive rates too, since a model that fixes fraud by declining good customers is worse than the fraud.
 
-**Business outcomes, on a lag.** True fraud labels arrive as chargebacks, weeks to months after the
-transaction. Precision, recall and AUC at the operating threshold therefore have to be computed on a
-delayed join against settled outcomes and backfilled to the original prediction date — a scheduled
-batch job, not a live dashboard. Alongside them, track approval rate and false-positive rate, since a
-model that fixes fraud by declining good customers is a worse outcome than the fraud was.
+## Features in production
 
----
+The brief supplies precomputed features. In production they wouldn't be, and this is where most of the real work lives. Three layers: where the raw signals come from, how they are computed, and how they are served at scoring time.
 
-## Feature computation and serving
+**Sources.** The transaction itself (amount, currency, merchant, MCC, country); device and session signals collected client-side, for example a browser risk script like Checkout's Risk.js (device fingerprint, IP, session duration, cookies); and historical aggregates (velocity: transactions per card in the last hour, distinct devices per account).
 
-The assignment supplies precomputed features. In production they would not be, and this is where most
-of the real engineering lives.
+**Computation.** Some features exist at request time (device, current amount); others are precomputed streaming aggregates (velocity counters maintained in a Kafka or Flink pipeline). The same transformation used in training, including the PCA, is then applied, so there is no train/serve skew.
 
-**Split features by how fresh they need to be.** Not everything needs the same pipeline, and treating
-it uniformly is how you end up paying streaming costs for data that changes monthly.
+<details>
+<summary>Freshness tiers</summary>
 
 | Class | Examples | Computed by | Latency |
 |---|---|---|---|
-| Realtime | Transactions on this card in the last 60s / 5m / 1h; amount vs. rolling mean | Kafka or Kinesis → Flink windowed aggregations | seconds |
-| Near-realtime | 24h/7d velocity, distinct-merchant counts, device history | Micro-batch Spark, every few minutes | minutes |
-| Batch | Cardholder tenure, merchant risk scores, historical chargeback rate | Nightly Spark/dbt over the warehouse | hours |
-| Request-time | Amount, currency, MCC, country, entry mode | Passed in the request itself | none |
+| Realtime | txns on this card in 60s/5m/1h | Kafka/Kinesis to Flink | seconds |
+| Near-realtime | 24h/7d velocity, device history | micro-batch Spark | minutes |
+| Batch | cardholder tenure, merchant risk | nightly Spark/dbt | hours |
+| Request-time | amount, currency, MCC, country | the request | none |
+</details>
 
-**Two-tier feature store.** An offline store (S3/Parquet, queried via Athena or Spark) holding full
-history for training and backfills; an online store (DynamoDB or ElastiCache/Redis) holding only the
-current value per entity key, optimised for single-digit-millisecond point reads. Feast, Tecton or
-SageMaker Feature Store all provide this shape; the important part is that **both tiers are populated
-by the same transformation code**. Reimplementing a feature separately for training and serving is the
-single most common source of train/serve skew, and it produces models that validate beautifully and
-underperform in production.
+**Serving and access.** Features not carried in the request are read at scoring time from an online feature store built for low-latency point reads (Feast, Tecton, SageMaker Feature Store, or a Redis/DynamoDB layer), keyed by entity (card, device, account). The request carries the identifiers, the service does one batched key lookup (about 10 to 20ms), merges with request-time fields, and scores, comfortably inside 200ms. An offline store (S3/Parquet) holds full history for training and backfills. The important part is that **both tiers are populated by the same transformation code**, because reimplementing a feature separately for training and serving is the top source of train/serve skew.
 
-**Point-in-time correctness in training.** Training sets must be built with as-of joins that reconstruct
-each feature's value *as it was at the moment of the transaction*, never its current value. Getting this
-wrong leaks the future into the training set and inflates offline metrics on a model that cannot
-reproduce them live.
+**Fail soft, never block the payment.** If the online store times out or misses, fall back to training medians or a conservative default, flag the response as degraded, and alert on the degraded rate. Returning nothing forces the caller to decline or approve everything, both worse than a slightly weaker score.
 
-**Access at inference.** The request carries identifiers — `transaction_id`, `card_id`, `merchant_id` —
-and the service does one batched key lookup (`BatchGetItem` / Redis `MGET`) against the online store,
-merges the result with the request-time fields, and scores. Within a 200ms p99 budget: ~10–20ms for the
-feature fetch, single-digit ms for inference, the rest headroom for network and serialisation.
+**Point-in-time correctness in training.** Training sets are built with as-of joins that reconstruct each feature as it was at the transaction moment, never its current value, or you leak the future and inflate offline metrics.
 
-**Fail soft, never block the payment.** If the online store times out or misses, fall back to training
-medians or a conservative default, flag the response as degraded, and emit a metric on it. A fraud
-service that returns nothing forces the caller to choose between declining every transaction or
-approving every transaction — both are worse than a slightly less accurate score. The degraded-response
-rate then becomes a first-class alert.
-
-**The PCA caveat.** For this specific model, `V1`–`V28` come from a PCA rotation that was never
-published, so no feature pipeline could reproduce them. In a real system the fitted transformer would be
-bundled with the estimator in a single `sklearn.Pipeline` and versioned as one artifact, so that
-preprocessing can never drift out of sync with the model that depends on it.
-
----
-
-## Other considerations
-
-**Return the model version.** Adding `model_version` to the response payload costs nothing and makes
-post-hoc analysis possible — without it, a scored transaction cannot be attributed to the model that
-scored it, which makes A/B tests and incident forensics guesswork.
-
-**Echo a correlation ID.** Accepting and returning `transaction_id` lets predictions be joined to
-outcomes later, which is a hard prerequisite for the delayed-label monitoring described above.
-
-**Pickle deserialisation is arbitrary code execution.** `pickle.load` will execute whatever is in the
-file. Acceptable here because the artifact is trusted and baked into the image, but the model path must
-never be attacker-controllable, and in a real pipeline the artifact should be checksum-verified against
-the model registry before loading. ONNX or skops would remove the risk class entirely.
-
-**Data handling.** Transaction features are personal data under GDPR. No feature values or identifiers
-in application logs; sampled request/response payloads for drift analysis should go to a separate,
-access-controlled store with an explicit retention policy, not into general logging infrastructure.
-
-**Network posture.** This should not be internet-facing. Deploy into a private subnet, expose it only to
-the payment authorisation service via an internal ALB with security-group restrictions, and authenticate
-callers with mTLS or a gateway-issued token.
-
-**Health and readiness must be distinct.** Liveness answers "is the process up"; readiness must confirm
-the model is loaded *and* that a warm prediction succeeds. Otherwise the load balancer routes traffic to
-containers that are running but cannot score, and the failure surfaces as 500s rather than as a failed
-deploy.
-
-**Explainability.** A fraud decision that cannot be explained is a problem for chargeback teams,
-customer support and regulators. Because `V1`–`V28` are anonymised components, no reason code derived
-from them is human-meaningful — "declined because V14 was low" is not something you can tell anyone. A
-production system needs features that map back to explainable concepts, which is a modelling
-constraint, not something the serving layer can fix.
-
----
+For this model specifically, `V1` to `V28` come from an unpublished PCA rotation, so no pipeline could reproduce them. In a real system the fitted transformer would be bundled with the estimator in one versioned `sklearn.Pipeline`, so preprocessing can't drift from the model.
 
 ## Testing
 
-`pytest` with FastAPI's `TestClient`, which drives the ASGI app in-process — no server, no sockets, so
-the suite runs in well under a second. 25 tests in four groups:
+`pytest` with FastAPI's `TestClient`, in-process, no sockets, runs in under a second. Four groups:
 
-**Contract.** The load-bearing group. Because the estimator has no `feature_names_in_`, mis-ordered
-input produces a confident wrong answer that nothing at runtime would flag. These assert
-`FEATURE_COLUMNS == list(Features.model_fields)`, that the count matches `model.n_features_in_`, that
-the constructed row carries values in declared order, and that `classes_ == [0, 1]` — without which
-`predict_proba[:, 1]` would be the *non*-fraud probability.
+- **Contract**, the load-bearing one. Because the estimator has no feature names, mis-ordered input fails silently, so these assert `FEATURE_COLUMNS == list(Features.model_fields)`, that the count matches `model.n_features_in_`, that the row preserves declared order, and that `classes_ == [0, 1]` (else `predict_proba[:, 1]` is the *non*-fraud probability).
+- **Scoring.** Status and range, agreement with a direct `predict_proba`, determinism, key-order independence, and a sensitivity sweep over the most-split features so a constant-output bug can't hide.
+- **Validation.** Missing, non-numeric, null, and unknown fields all return `422`; ints coerce to floats; `GET` returns `405`.
+- **Failure.** A patched estimator that raises must return `500` with the generic message and no exception text.
 
-**Scoring.** Status and range, agreement with a direct `predict_proba` call, determinism, and
-independence from JSON key order. Plus a sensitivity sweep over `V14`, `V17` and `V12` — the most
-heavily split features in the forest — asserting the score actually moves. Nearly every transaction
-scores close to zero, so a bug returning a constant would otherwise satisfy every other assertion here.
+Not yet covered: a golden-value test pinning the score for the mock body to catch an accidental model swap.
 
-**Validation.** Missing, non-numeric, null and unknown fields all `422`; integers coerce to floats;
-`GET` is `405`.
+## Notes
 
-**Failure handling.** A monkeypatched estimator that raises must yield a `500` whose body contains the
-generic message and none of the exception text.
-
-Not yet covered: a load test (Locust or `k6`) to substantiate the p99 target rather than reason about
-it, and a golden-value regression test pinning the exact score for the mock body, which would catch an
-unintended model swap.
-
----
+- **Return `model_version`** in the response. It costs nothing, and without it a scored transaction can't be attributed to the model that scored it, which makes A/B tests and incident forensics guesswork.
+- **Echo a `transaction_id`** so predictions can be joined to outcomes later. That is the prerequisite for the lagged monitoring above.
+- **Pickle is arbitrary code execution.** Fine here, since the artifact is trusted and baked into the image, but the path must never be caller-controllable, and a real pipeline would checksum against the registry. ONNX or skops removes the risk class entirely.
+- **PII.** Transaction features are personal data under GDPR. No feature values or identifiers in logs; drift samples go to a separate, access-controlled store with a retention policy.
+- **Not internet-facing.** Private subnet, internal ALB, exposed only to the auth service, callers authenticated by mTLS or a gateway token.
+- **Liveness is not readiness.** Readiness must confirm the model is loaded and that a warm prediction succeeds, or the load balancer routes to containers that are up but can't score.
+- **Explainability.** With anonymised components, no reason code is human-meaningful. "Declined because V14 was low" helps no one. That is a modelling constraint the serving layer can't fix.
 
 ## Given more time
 
-Roughly in the order I would tackle them:
+Roughly in the order I'd tackle them:
 
-1. **Startup lifecycle.** Move model loading into a FastAPI `lifespan` handler with a warm-up
-   prediction, resolve `MODEL_PATH` relative to the package root rather than the working directory, and
-   fail fast with a clear message if the artifact is missing. Import-time loading makes the module
-   CWD-sensitive to run and awkward to test — `tests/conftest.py` currently has to set `MODEL_PATH` to
-   an absolute path *before* importing the app, which is a workaround for exactly this.
-2. **`/health` and `/ready` endpoints.** Readiness should run a real prediction, not just confirm the
-   process is up. The container healthcheck currently probes `/openapi.json`, which proves only that
-   HTTP is being served.
-3. **Observability**: `model_version` and `transaction_id` on the response schema, structured JSON
-   logging with a correlation ID, and Prometheus instrumentation.
-4. **Replace the per-request DataFrame** with direct NumPy array construction. This also silences a
-   `UserWarning` sklearn emits on *every* prediction — "X has feature names, but
-   RandomForestClassifier was fitted without feature names" — which at production request rates is
-   meaningful log volume for no information.
-5. **Load testing** to verify the p99 target under realistic concurrency.
-6. **Retrain without `Time`**, or wrap the estimator in a `Pipeline`, so the API contract stops carrying
-   a field that means nothing to callers.
-7. **`docker-compose.yml`** for a one-command local stack once there are dependencies (feature store,
-   metrics collector) to bring up alongside the service.
-
-
-![Alt text](app/assets/image.png "Post Man for Testing API response time")
+1. **Startup lifecycle.** Move model loading into a FastAPI `lifespan` handler with a warm-up prediction, resolve `MODEL_PATH` relative to the package root rather than the working directory, and fail fast with a clear message if the artifact is missing. Import-time loading makes the module CWD-sensitive to run and awkward to test: `tests/conftest.py` currently sets `MODEL_PATH` to an absolute path before importing the app, a workaround for exactly this.
+2. **`/health` and `/ready` endpoints.** Readiness should run a real prediction, not just confirm the process is up. The container healthcheck currently probes `/openapi.json`, which proves only that HTTP is being served.
+3. **Observability.** `model_version` and `transaction_id` on the response schema, structured JSON logging with a correlation ID, and Prometheus instrumentation.
+4. **Wire the load test into CI** and commit the resulting numbers, so the p99 table is enforced rather than a one-off.
+5. **Retrain without `Time`**, or wrap the estimator in a `Pipeline`, so the contract stops carrying a field that means nothing to callers.
+6. **`docker-compose.yml`** once there are local dependencies (feature store, metrics collector) to bring up alongside the service.
