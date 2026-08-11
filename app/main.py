@@ -6,9 +6,9 @@ is fraudulent, so that callers can apply their own decision threshold rather
 than receiving a hard accept/decline.
 
 Inputs are the 30 features of the ULB credit-card fraud dataset: ``Time``,
-``V1``-``V28`` and ``Amount``. ``V1``-``V28`` are anonymised principal
+``V1`` to ``V28`` and ``Amount``. ``V1`` to ``V28`` are anonymised principal
 components, so this service expects vectors that have *already* been through
-the dataset's PCA transform -- it does no feature engineering of its own.
+the dataset's PCA transform. It does no feature engineering of its own.
 ``FEATURE_COLUMNS`` pins the column order the model was fitted on; the
 estimator carries no ``feature_names_in_``, so ordering is enforced here or
 not at all.
@@ -22,7 +22,7 @@ process lifetime.
 import logging
 import os
 
-import pandas as pd
+import numpy as np
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -37,11 +37,12 @@ load_dotenv()  # Load environment variables from .env file
 
 app = FastAPI()
 
+
 class Features(BaseModel):  # pylint: disable=too-few-public-methods
     """Transaction features for fraud score prediction.
 
-    Field declaration order is significant: FEATURE_COLUMNS is asserted against
-    it in the test suite, and the estimator has no feature names of its own.
+    Field declaration order is significant: FEATURE_COLUMNS is derived from it,
+    and the estimator has no feature names of its own.
     """
 
     # Reject unrecognised fields rather than silently dropping them. A caller
@@ -80,40 +81,15 @@ class Features(BaseModel):  # pylint: disable=too-few-public-methods
     V28: float
     Amount: float
 
+
 class FraudResponse(BaseModel):
     fraud_score: float = Field(serialization_alias="fraud-score")
 
-FEATURE_COLUMNS = [
-    "Time",
-    "V1",
-    "V2",
-    "V3",
-    "V4",
-    "V5",
-    'V6',
-    'V7',
-    'V8',
-    'V9',
-    'V10',
-    'V11',
-    'V12',
-    'V13',
-    'V14',
-    'V15',
-    'V16',
-    'V17',
-    'V18',
-    'V19',
-    'V20',
-    'V21',
-    'V22',
-    'V23',
-    'V24',
-    'V25',
-    'V26',
-    'V27',
-    'V28',
-    'Amount']
+
+# Single source of truth for column order, derived from the schema so the two
+# can never drift. Pydantic v2 preserves field-declaration order, and
+# model_config is a ClassVar rather than a field, so it does not appear here.
+FEATURE_COLUMNS = list(Features.model_fields)
 
 # Load Fraud Prevention model
 model_path = os.getenv("MODEL_PATH", "models/fraud-model.pickle")
@@ -122,18 +98,23 @@ model = load_model(model_path=model_path)
 
 @app.post("/fraud-score", response_model=FraudResponse)
 def predict_fraud_score(data: Features) -> FraudResponse:
-    """predict fraud score for a single transaction
+    """Predict the fraud score for a single transaction.
 
     Args:
         data (Features): input features for the transaction
 
     Returns:
-        FraudResponse: The fraud score for the transaction
+        FraudResponse: the fraud score for the transaction
     """
-    row = pd.DataFrame([data.model_dump()], columns=FEATURE_COLUMNS)
-    # fraud score is the probability of the transaction being fraudulent
+    # Build a one-row 2-D array in the pinned column order. Constructing the
+    # array directly, rather than via a DataFrame, keeps per-request DataFrame
+    # overhead off the hot path; and because the estimator was fitted without
+    # feature names, a bare array also avoids sklearn's per-call
+    # "X has feature names" warning.
+    features = data.model_dump()
+    row = np.array([[features[name] for name in FEATURE_COLUMNS]], dtype=float)
     try:
-        fraud_score = float(model.predict_proba(row.to_numpy())[0,1])
+        fraud_score = float(model.predict_proba(row)[0, 1])
     except Exception as exc:
         logger.exception("Model prediction failed")
         raise HTTPException(
@@ -144,7 +125,6 @@ def predict_fraud_score(data: Features) -> FraudResponse:
 
 
 if __name__ == "__main__":
-
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
