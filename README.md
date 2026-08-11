@@ -235,7 +235,7 @@ Not yet covered: a golden-value test pinning the score for the mock body to catc
 
 Roughly in the order I'd tackle them:
 
-1. **Startup lifecycle.** Move model loading into a FastAPI `lifespan` handler with a warm-up prediction, resolve `MODEL_PATH` relative to the package root rather than the working directory, and fail fast with a clear message if the artifact is missing. Import-time loading makes the module CWD-sensitive to run and awkward to test: `tests/conftest.py` currently sets `MODEL_PATH` to an absolute path before importing the app, a workaround for exactly this.
+1. **Startup lifecycle.** Move model loading into a FastAPI `lifespan` handler with a warm-up prediction and fail fast with a clear message if the artifact is missing. The default `MODEL_PATH` already resolves relative to the package root, so the app runs from any directory; what remains is that loading still happens at import time, so the model must be present just to import the module. A lifespan handler makes that explicit and keeps the module importable without side effects.
 2. **`/health` and `/ready` endpoints.** Readiness should run a real prediction, not just confirm the process is up. The container healthcheck currently probes `/openapi.json`, which proves only that HTTP is being served.
 3. **Observability.** `model_version` and `transaction_id` on the response schema, structured JSON logging with a correlation ID, and Prometheus instrumentation.
 4. **Wire the load test into CI** and commit the resulting numbers, so the p99 table is enforced rather than a one-off.
