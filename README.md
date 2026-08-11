@@ -104,7 +104,7 @@ Fifteen trees, `max_depth=5`, trained on the ULB credit-card dataset (`Time`, `V
 Target is p99 under 200ms, and the model is nowhere near the bottleneck. Fifteen depth-5 trees is about 75 comparisons, single-digit microseconds. The budget goes to JSON parsing, validation, and the HTTP round trip, so that is where tuning belongs.
 
 - **`def`, not `async def`.** `predict_proba` is blocking CPU work; on the event loop it would stall every other request. As a sync endpoint FastAPI runs it in a threadpool, and sklearn releases the GIL in its Cython loop so those threads run in parallel. This is the change that actually protects the tail: a single request looks fast either way, but under concurrency an async blocking handler serialises everything behind the event loop and the p99 balloons.
-- **Model loaded once at import**, held in memory. Deserializing per request would blow the whole budget.
+- **Model loaded and warmed once on startup.** A FastAPI `lifespan` handler loads the pickle and runs one throwaway prediction before the server accepts traffic, so no request pays deserialization or sklearn's first-call costs, and a missing artifact fails the deploy fast rather than erroring mid-request.
 - **The input row is a bare NumPy array**, built directly from `FEATURE_COLUMNS`, not a per-request `DataFrame`. That keeps roughly 100 to 200µs of DataFrame construction (an order of magnitude more than the prediction itself) off the hot path, and since the estimator was fitted without feature names, a bare array also avoids the per-call `X has feature names` warning sklearn would otherwise log on every request.
 
 ### Latency
@@ -140,7 +140,6 @@ The pytest suite includes a single-request smoke check, but a `TestClient` runs 
 - `n_jobs=1` on the estimator. Joblib dispatch costs more than scoring 15 tiny trees.
 - `OMP_NUM_THREADS=1` and `MKL_NUM_THREADS=1`. Otherwise each worker spawns a BLAS pool and oversubscribes the CPU, which shows up as erratic tail latency. (Set in the `Dockerfile`.)
 - `workers = CPU cores`, scale horizontally. The workload is stateless and embarrassingly parallel.
-- A warm-up prediction at startup, so the first real request doesn't pay one-off allocation costs.
 </details>
 
 ## Deployment
@@ -235,9 +234,8 @@ Not yet covered: a golden-value test pinning the score for the mock body to catc
 
 Roughly in the order I'd tackle them:
 
-1. **Startup lifecycle.** Move model loading into a FastAPI `lifespan` handler with a warm-up prediction and fail fast with a clear message if the artifact is missing. The default `MODEL_PATH` already resolves relative to the package root, so the app runs from any directory; what remains is that loading still happens at import time, so the model must be present just to import the module. A lifespan handler makes that explicit and keeps the module importable without side effects.
-2. **`/health` and `/ready` endpoints.** Readiness should run a real prediction, not just confirm the process is up. The container healthcheck currently probes `/openapi.json`, which proves only that HTTP is being served.
-3. **Observability.** `model_version` and `transaction_id` on the response schema, structured JSON logging with a correlation ID, and Prometheus instrumentation.
-4. **Wire the load test into CI** and commit the resulting numbers, so the p99 table is enforced rather than a one-off.
-5. **Retrain without `Time`**, or wrap the estimator in a `Pipeline`, so the contract stops carrying a field that means nothing to callers.
-6. **`docker-compose.yml`** once there are local dependencies (feature store, metrics collector) to bring up alongside the service.
+1. **`/health` and `/ready` endpoints.** Explicit liveness and readiness checks, with readiness running a real prediction. The container healthcheck currently probes `/openapi.json`, which works but is incidental rather than a purpose-built check.
+2. **Observability.** `model_version` and `transaction_id` on the response schema, structured JSON logging with a correlation ID, and Prometheus instrumentation.
+3. **Wire the load test into CI** and commit the resulting numbers, so the p99 table is enforced rather than a one-off.
+4. **Retrain without `Time`**, or wrap the estimator in a `Pipeline`, so the contract stops carrying a field that means nothing to callers.
+5. **`docker-compose.yml`** once there are local dependencies (feature store, metrics collector) to bring up alongside the service.
