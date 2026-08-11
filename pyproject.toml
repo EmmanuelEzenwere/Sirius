@@ -12,7 +12,6 @@ dependencies = [
     "uvicorn[standard] (>=0.52.1,<0.53.0)",
     "python-dotenv (>=1.2.2,<2.0.0)",
     "scikit-learn (==1.0.2)",
-    "pandas (<2.3)",
     "numpy (<1.24)"
 ]
 
@@ -28,6 +27,7 @@ package-mode = false
 pytest = "^8.4.2"
 # TestClient drives the ASGI app in-process; httpx is its transport.
 httpx = "^0.28.1"
+pandas = "<2.3"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
