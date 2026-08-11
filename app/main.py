@@ -13,14 +13,15 @@ the dataset's PCA transform. It does no feature engineering of its own.
 estimator carries no ``feature_names_in_``, so ordering is enforced here or
 not at all.
 
-The model is loaded once at import time from ``MODEL_PATH`` (see ``.env``,
-defaulting to ``models/fraud-model.pickle``) and held in module state for the
-process lifetime.
+The model is loaded once at import time from ``MODEL_PATH`` (see ``.env``),
+defaulting to the bundled ``models/fraud-model.pickle`` resolved relative to the
+package root, and held in module state for the process lifetime.
 """
 
 
 import logging
 import os
+from pathlib import Path
 
 import numpy as np
 import uvicorn
@@ -91,8 +92,12 @@ class FraudResponse(BaseModel):
 # model_config is a ClassVar rather than a field, so it does not appear here.
 FEATURE_COLUMNS = list(Features.model_fields)
 
-# Load Fraud Prevention model
-model_path = os.getenv("MODEL_PATH", "models/fraud-model.pickle")
+# Resolve the default model path relative to the package root (app/main.py, up
+# to the repo root, then models/), so it works regardless of the directory the
+# process is launched from. An explicit MODEL_PATH still overrides, e.g. to
+# point at a candidate binary.
+DEFAULT_MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "fraud-model.pickle"
+model_path = os.getenv("MODEL_PATH", str(DEFAULT_MODEL_PATH))
 model = load_model(model_path=model_path)
 
 
