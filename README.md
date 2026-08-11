@@ -43,7 +43,7 @@ poetry install
 poetry run uvicorn app.main:app --host 0.0.0.0 --port 8888
 ```
 
-Either way the service listens on `http://localhost:8888`, with OpenAPI docs at `/docs`. Verify it with the supplied mock body:
+The service listens on `http://localhost:8888`, with OpenAPI docs at `/docs`. Verify with the supplied mock body:
 
 ```bash
 curl -X POST http://localhost:8888/fraud-score \
