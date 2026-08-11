@@ -13,14 +13,17 @@ the dataset's PCA transform. It does no feature engineering of its own.
 estimator carries no ``feature_names_in_``, so ordering is enforced here or
 not at all.
 
-The model is loaded once at import time from ``MODEL_PATH`` (see ``.env``),
-defaulting to the bundled ``models/fraud-model.pickle`` resolved relative to the
-package root, and held in module state for the process lifetime.
+The model is loaded once on startup by a ``lifespan`` handler from ``MODEL_PATH``
+(see ``.env``), defaulting to the bundled ``models/fraud-model.pickle`` resolved
+relative to the package root, and held in module state for the process lifetime.
+Loading on startup rather than at import keeps the module importable without
+side effects and surfaces a missing artifact as a clear startup failure.
 """
 
 
 import logging
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import numpy as np
@@ -35,8 +38,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 load_dotenv()  # Load environment variables from .env file
-
-app = FastAPI()
 
 
 class Features(BaseModel):  # pylint: disable=too-few-public-methods
@@ -97,8 +98,32 @@ FEATURE_COLUMNS = list(Features.model_fields)
 # process is launched from. An explicit MODEL_PATH still overrides, e.g. to
 # point at a candidate binary.
 DEFAULT_MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "fraud-model.pickle"
-model_path = os.getenv("MODEL_PATH", str(DEFAULT_MODEL_PATH))
-model = load_model(model_path=model_path)
+
+# Populated on startup by the lifespan handler; held for the process lifetime.
+model = None
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Load the model on startup, fail fast if it is missing, then warm it.
+
+    Deferring the load to startup rather than import time keeps the module
+    importable without side effects. The warm-up prediction pays sklearn's
+    one-off first-call costs here, at startup, instead of on the first customer
+    request right after a deploy.
+    """
+    global model
+    path = os.getenv("MODEL_PATH", str(DEFAULT_MODEL_PATH))
+    if not Path(path).exists():
+        raise RuntimeError(f"Model artifact not found at {path!r}")
+    model = load_model(model_path=path)
+    model.predict_proba(np.zeros((1, len(FEATURE_COLUMNS)), dtype=float))
+    logger.info("Model loaded and warmed from %s", path)
+    yield
+    model = None
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.post("/fraud-score", response_model=FraudResponse)
